@@ -5,10 +5,11 @@ export default function Home() {
         🍽️ Meal Planner
       </h1>
       <p className="text-zinc-600 dark:text-zinc-400">
-        Scaffold complete — week calendar coming soon.
-      </p>
-      <p className="rounded-full bg-zinc-200 px-3 py-1 text-sm text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
-        Next.js · Prisma · Tailwind · dnd-kit
+        The week calendar will live here. For now, start by filling your{" "}
+        <a href="/meals" className="font-medium underline">
+          Meal Library
+        </a>
+        .
       </p>
     </main>
   );
