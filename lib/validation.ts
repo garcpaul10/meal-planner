@@ -33,3 +33,26 @@ export const SeedMealSchema = z.object({
 export const SeedInputSchema = z.object({
   meals: z.array(SeedMealSchema).min(1).max(50),
 });
+
+export const YMD = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
+
+export const PlannedStatusEnum = z.enum(["PLANNED", "EATEN", "SKIPPED", "EATING_OUT"]);
+
+export const PlannedMealCreateSchema = z.object({
+  date: YMD,
+  slot: MealSlotEnum,
+  mealId: z.string().min(1),
+});
+
+export const PlannedMealMoveSchema = z.object({
+  id: z.string().min(1),
+  date: YMD,
+  slot: MealSlotEnum,
+});
+
+export const PlannedMealPatchSchema = z.object({
+  locked: z.boolean().optional(),
+  status: PlannedStatusEnum.optional(),
+  aiReason: z.string().nullable().optional(),
+  sortOrder: z.number().int().optional(),
+});

@@ -25,6 +25,19 @@ export type MealDTO = {
   createdAt: string;
 };
 
+export type PlannedStatus = "PLANNED" | "EATEN" | "SKIPPED" | "EATING_OUT";
+
+export type PlannedDTO = {
+  id: string;
+  date: string; // YYYY-MM-DD
+  slot: Slot;
+  locked: boolean;
+  status: PlannedStatus;
+  aiReason: string | null;
+  sortOrder: number;
+  meal: MealDTO;
+};
+
 export const FREQUENCIES = [
   { value: "daily", label: "Every day" },
   { value: "few-times-a-week", label: "A few times a week" },
