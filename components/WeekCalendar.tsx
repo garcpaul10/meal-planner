@@ -40,6 +40,9 @@ export default function WeekCalendar({
   const [dragging, setDragging] = useState<DragItem | null>(null);
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
+  const [planning, setPlanning] = useState(false);
+  const [usePantry, setUsePantry] = useState(false);
+  const [rerolling, setRerolling] = useState<string | null>(null); // cell key
 
   const days = useMemo(
     () => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)),
@@ -66,6 +69,57 @@ export default function WeekCalendar({
       }
       return next;
     });
+  }
+
+  async function planThisWeek() {
+    if (planning) return;
+    setPlanning(true);
+    try {
+      const res = await fetch("/api/plan-week", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ weekStart, usePantry }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error ?? "Planning failed — please try again.");
+        return;
+      }
+      const rows: PlannedDTO[] = data.map(serialize);
+      setPlanned((prev) => {
+        // Keep locked cells; replace everything else in this week with the new plan.
+        const next: Record<string, PlannedDTO> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v.locked || v.date < weekStart || v.date > addDays(weekStart, 6)) next[k] = v;
+        }
+        for (const row of rows) next[cellKey(row.date, row.slot)] = row;
+        return next;
+      });
+      router.refresh();
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  async function reroll(date: string, slot: Slot) {
+    const key = cellKey(date, slot);
+    if (rerolling) return;
+    setRerolling(key);
+    try {
+      const res = await fetch("/api/reroll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, slot }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error ?? "Could not reroll that slot — please try again.");
+        return;
+      }
+      applyRows([serialize(data)]);
+    } finally {
+      setRerolling(null);
+    }
   }
 
   function onDragStart(e: DragStartEvent) {
@@ -141,7 +195,25 @@ export default function WeekCalendar({
               {fmtWeekRange(weekStart)}
             </h1>
             {saving && <span className="text-xs text-zinc-400">saving…</span>}
-            <div className="ml-auto flex gap-1">
+            <div className="ml-auto flex items-center gap-2">
+              <label className="flex cursor-pointer items-center gap-1 text-xs text-zinc-500">
+                <input
+                  type="checkbox"
+                  checked={usePantry}
+                  onChange={(e) => setUsePantry(e.target.checked)}
+                  className="accent-zinc-700"
+                />
+                Use my pantry
+              </label>
+              <button
+                onClick={planThisWeek}
+                disabled={planning}
+                className="rounded-lg bg-zinc-900 px-3 py-1 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                {planning ? "Planning… (up to a minute)" : "✨ Plan this week"}
+              </button>
+            </div>
+            <div className="flex gap-1">
               <NavBtn href={`/?week=${addDays(weekStart, -7)}`}>← Prev</NavBtn>
               <NavBtn href="/">Today</NavBtn>
               <NavBtn href={`/?week=${addDays(weekStart, 7)}`}>Next →</NavBtn>
@@ -179,6 +251,8 @@ export default function WeekCalendar({
                   slot={slot}
                   days={days}
                   planned={planned}
+                  onReroll={reroll}
+                  rerolling={rerolling}
                 />
               ))}
             </div>
@@ -255,10 +329,14 @@ function SlotRow({
   slot,
   days,
   planned,
+  onReroll,
+  rerolling,
 }: {
   slot: Slot;
   days: string[];
   planned: Record<string, PlannedDTO>;
+  onReroll: (date: string, slot: Slot) => void;
+  rerolling: string | null;
 }) {
   return (
     <>
@@ -266,13 +344,32 @@ function SlotRow({
         {SLOT_LABELS[slot]}
       </div>
       {days.map((date) => (
-        <Cell key={date} date={date} slot={slot} planned={planned[cellKey(date, slot)]} />
+        <Cell
+          key={date}
+          date={date}
+          slot={slot}
+          planned={planned[cellKey(date, slot)]}
+          onReroll={onReroll}
+          rerolling={rerolling === cellKey(date, slot)}
+        />
       ))}
     </>
   );
 }
 
-function Cell({ date, slot, planned }: { date: string; slot: Slot; planned?: PlannedDTO }) {
+function Cell({
+  date,
+  slot,
+  planned,
+  onReroll,
+  rerolling,
+}: {
+  date: string;
+  slot: Slot;
+  planned?: PlannedDTO;
+  onReroll: (date: string, slot: Slot) => void;
+  rerolling: boolean;
+}) {
   const { setNodeRef, isOver } = useDroppable({ id: `cell:${date}:${slot}` });
   return (
     <div
@@ -283,12 +380,22 @@ function Cell({ date, slot, planned }: { date: string; slot: Slot; planned?: Pla
           : "border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
       }`}
     >
-      {planned && <PlannedCard planned={planned} />}
+      {planned && (
+        <PlannedCard planned={planned} onReroll={() => onReroll(date, slot)} rerolling={rerolling} />
+      )}
     </div>
   );
 }
 
-function PlannedCard({ planned }: { planned: PlannedDTO }) {
+function PlannedCard({
+  planned,
+  onReroll,
+  rerolling,
+}: {
+  planned: PlannedDTO;
+  onReroll: () => void;
+  rerolling: boolean;
+}) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `pm:${planned.id}`,
     data: { type: "pm", planned } satisfies DragItem,
@@ -298,9 +405,10 @@ function PlannedCard({ planned }: { planned: PlannedDTO }) {
       ref={setNodeRef}
       {...listeners}
       {...attributes}
-      className={`flex h-full cursor-grab flex-col gap-0.5 rounded-md p-1.5 text-xs active:cursor-grabbing ${
+      title={planned.aiReason ?? undefined}
+      className={`group flex h-full cursor-grab flex-col gap-0.5 rounded-md p-1.5 text-xs active:cursor-grabbing ${
         isDragging ? "opacity-30" : ""
-      }`}
+      } ${rerolling ? "animate-pulse" : ""}`}
       style={{ backgroundColor: planned.meal.colorHex + "22" }}
     >
       <div className="flex items-center gap-1">
@@ -312,6 +420,15 @@ function PlannedCard({ planned }: { planned: PlannedDTO }) {
           {planned.meal.name}
         </span>
         {planned.locked && <span title="Locked">🔒</span>}
+        <button
+          type="button"
+          title="Ask the AI for a different meal here"
+          onClick={onReroll}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="ml-auto rounded px-0.5 opacity-0 transition hover:bg-white/60 group-hover:opacity-100 dark:hover:bg-black/30"
+        >
+          🎲
+        </button>
       </div>
       {planned.meal.prepMinutes > 0 && (
         <span className="text-[10px] text-zinc-500">⏱ {planned.meal.prepMinutes}m</span>
