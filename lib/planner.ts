@@ -5,7 +5,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { defaultColorFor } from "@/lib/categories";
 import { addDays, mondayOf } from "@/lib/dates";
-import type { MealSlot, Prisma } from "@/lib/generated/prisma/client";
+import type { MealSlot } from "@/lib/generated/prisma/client";
 
 // ---------- Plan schema (what Claude must return) ----------
 
@@ -43,75 +43,37 @@ const PlanSchema = z.object({
 export type Plan = z.infer<typeof PlanSchema>;
 type SlotPlan = z.infer<typeof SlotPlanSchema>;
 
-// JSON Schema for the API's structured-output format (hand-written: keeps us
-// independent of zod-version-specific SDK helpers).
-const PLAN_JSON_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["days"],
-  properties: {
-    days: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["date", "slots"],
-        properties: {
-          date: { type: "string" },
-          slots: {
-            type: "object",
-            additionalProperties: false,
-            required: ["breakfast", "lunch", "dinner", "snack"],
-            properties: Object.fromEntries(
-              ["breakfast", "lunch", "dinner", "snack"].map((s) => [
-                s,
-                {
-                  type: "object",
-                  additionalProperties: false,
-                  required: ["mealName", "existingMealId", "aiReason", "newMealDetails"],
-                  properties: {
-                    mealName: { type: "string" },
-                    existingMealId: { type: ["string", "null"] },
-                    aiReason: { type: "string" },
-                    newMealDetails: {
-                      anyOf: [
-                        { type: "null" },
-                        {
-                          type: "object",
-                          additionalProperties: false,
-                          required: ["category", "prepMinutes", "ingredients", "recipe", "tags"],
-                          properties: {
-                            category: { type: "string" },
-                            prepMinutes: { type: "integer" },
-                            ingredients: {
-                              type: "array",
-                              items: {
-                                type: "object",
-                                additionalProperties: false,
-                                required: ["name", "qty", "unit"],
-                                properties: {
-                                  name: { type: "string" },
-                                  qty: { type: "number" },
-                                  unit: { type: "string" },
-                                },
-                              },
-                            },
-                            recipe: { type: "string" },
-                            tags: { type: "array", items: { type: "string" } },
-                          },
-                        },
-                      ],
-                    },
-                  },
-                },
-              ]),
-            ),
+// Example shape shown to the model in the system prompt.
+const EXAMPLE_SHAPE = {
+  days: [
+    {
+      date: "2026-07-06",
+      slots: {
+        breakfast: {
+          mealName: "Veggie omelette",
+          existingMealId: "cm3xk2 or null",
+          aiReason: "your usual weekday breakfast",
+          newMealDetails: null,
+        },
+        lunch: {
+          mealName: "New meal example",
+          existingMealId: null,
+          aiReason: "why",
+          newMealDetails: {
+            category: "salad",
+            prepMinutes: 15,
+            ingredients: [{ name: "example", qty: 1, unit: "cup" }],
+            recipe: "1. ...",
+            tags: ["quick"],
           },
         },
+        dinner: { mealName: "...", existingMealId: null, aiReason: "...", newMealDetails: null },
+        snack: { mealName: "...", existingMealId: null, aiReason: "...", newMealDetails: null },
       },
     },
-  },
-} as const;
+  ],
+};
+
 
 // ---------- Prompt building ----------
 
@@ -147,10 +109,25 @@ async function loadPrefs(): Promise<Prefs> {
 
 function loadTemplate(): { system: string; user: string; reroll: string } {
   const raw = fs.readFileSync(path.join(process.cwd(), "prompts", "plan-week.md"), "utf8");
-  const system = raw.split("## SYSTEM PROMPT")[1].split("## USER PROMPT")[0].trim();
-  const user = raw.split("## USER PROMPT")[1].split("## REROLL PROMPT")[0].trim();
-  const reroll = raw.split("## REROLL PROMPT")[1].trim();
-  return { system, user, reroll };
+  // Split on line-anchored level-2 headings only, so prose mentioning the
+  // section names can never break the parse.
+  const sections: Record<string, string> = {};
+  let current = "";
+  for (const line of raw.split("\n")) {
+    const heading = line.match(/^## (.+?)\s*$/);
+    if (heading) {
+      current = heading[1];
+      sections[current] = "";
+    } else if (current) {
+      sections[current] += line + "\n";
+    }
+  }
+  const get = (name: string) => {
+    const value = sections[name]?.trim();
+    if (!value) throw new Error(`prompts/plan-week.md is missing the "## ${name}" section`);
+    return value;
+  };
+  return { system: get("SYSTEM PROMPT"), user: get("USER PROMPT"), reroll: get("REROLL PROMPT") };
 }
 
 function fill(template: string, vars: Record<string, string>): string {
@@ -257,10 +234,10 @@ async function callClaude(system: string, user: string): Promise<Plan> {
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 16000,
-      system,
-      output_config: {
-        format: { type: "json_schema", schema: PLAN_JSON_SCHEMA },
-      },
+      system:
+        system +
+        "\n\nOutput ONLY a valid JSON object matching this exact structure — no prose, no markdown, no code fences:\n" +
+        JSON.stringify(EXAMPLE_SHAPE, null, 1),
       messages: [{ role: "user", content: user + extra }],
     });
     if (response.stop_reason === "refusal") {
@@ -288,41 +265,37 @@ async function callClaude(system: string, user: string): Promise<Plan> {
 
 // ---------- Applying a plan ----------
 
-async function applySlot(
-  tx: Prisma.TransactionClient,
+// Resolves a slot plan to a mealId, creating a new AI meal when needed.
+async function resolveMealId(
   date: string,
   slot: MealSlot,
   plan: SlotPlan,
   mealIds: Set<string>,
-) {
-  const day = new Date(date + "T00:00:00Z");
+  newMealCache: Map<string, string>,
+): Promise<string> {
+  if (plan.existingMealId && mealIds.has(plan.existingMealId)) return plan.existingMealId;
 
-  let mealId = plan.existingMealId && mealIds.has(plan.existingMealId) ? plan.existingMealId : null;
+  const cacheKey = plan.mealName.trim().toLowerCase();
+  const cached = newMealCache.get(cacheKey);
+  if (cached) return cached;
 
-  if (!mealId) {
-    const details = plan.newMealDetails;
-    const category = details?.category ?? "other";
-    const created = await tx.meal.create({
-      data: {
-        name: plan.mealName,
-        mealTypes: [slot],
-        category,
-        colorHex: defaultColorFor(category),
-        recipe: details?.recipe || null,
-        ingredients: details?.ingredients ?? [],
-        prepMinutes: details?.prepMinutes ?? 0,
-        tags: details?.tags ?? [],
-        isAiGenerated: true,
-      },
-    });
-    mealId = created.id;
-  }
-
-  await tx.plannedMeal.deleteMany({ where: { date: day, slot, locked: false } });
-  return tx.plannedMeal.create({
-    data: { date: day, slot, mealId, aiReason: plan.aiReason },
-    include: { meal: true },
+  const details = plan.newMealDetails;
+  const category = details?.category ?? "other";
+  const created = await prisma.meal.create({
+    data: {
+      name: plan.mealName,
+      mealTypes: [slot],
+      category,
+      colorHex: defaultColorFor(category),
+      recipe: details?.recipe || null,
+      ingredients: details?.ingredients ?? [],
+      prepMinutes: details?.prepMinutes ?? 0,
+      tags: details?.tags ?? [],
+      isAiGenerated: true,
+    },
   });
+  newMealCache.set(cacheKey, created.id);
+  return created.id;
 }
 
 export async function planWeek(weekStart: string, usePantry: boolean) {
@@ -338,21 +311,45 @@ export async function planWeek(weekStart: string, usePantry: boolean) {
   );
   const validDates = new Set(Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)));
 
-  return prisma.$transaction(
-    async (tx) => {
-      const created = [];
-      for (const day of plan.days) {
-        if (!validDates.has(day.date)) continue;
-        for (const key of SLOT_KEYS) {
-          const slot = SLOT_ENUM[key];
-          if (lockedCells.has(`${day.date}|${slot}`)) continue;
-          created.push(await applySlot(tx, day.date, slot, day.slots[key], mealIds));
-        }
-      }
-      return created;
+  // Resolve all meals first (creates the few new AI meals), then swap the
+  // week's contents in a handful of bulk queries.
+  const newMealCache = new Map<string, string>();
+  const rows: { date: Date; slot: MealSlot; mealId: string; aiReason: string }[] = [];
+  for (const day of plan.days) {
+    if (!validDates.has(day.date)) continue;
+    for (const key of SLOT_KEYS) {
+      const slot = SLOT_ENUM[key];
+      if (lockedCells.has(`${day.date}|${slot}`)) continue;
+      const mealId = await resolveMealId(day.date, slot, day.slots[key], mealIds, newMealCache);
+      rows.push({
+        date: new Date(day.date + "T00:00:00Z"),
+        slot,
+        mealId,
+        aiReason: day.slots[key].aiReason,
+      });
+    }
+  }
+
+  await prisma.plannedMeal.deleteMany({
+    where: {
+      locked: false,
+      date: {
+        gte: new Date(weekStart + "T00:00:00Z"),
+        lte: new Date(addDays(weekStart, 6) + "T00:00:00Z"),
+      },
     },
-    { timeout: 30000 },
-  );
+  });
+  await prisma.plannedMeal.createMany({ data: rows });
+
+  return prisma.plannedMeal.findMany({
+    where: {
+      date: {
+        gte: new Date(weekStart + "T00:00:00Z"),
+        lte: new Date(addDays(weekStart, 6) + "T00:00:00Z"),
+      },
+    },
+    include: { meal: true },
+  });
 }
 
 export async function rerollSlot(date: string, slot: MealSlot) {
@@ -388,8 +385,11 @@ export async function rerollSlot(date: string, slot: MealSlot) {
   if (!slotPlan) throw new Error("The AI did not return a replacement for that slot.");
 
   const mealIds = new Set(ctx.meals.map((m) => m.id));
-  return prisma.$transaction(
-    async (tx) => applySlot(tx, date, slot, slotPlan, mealIds),
-    { timeout: 30000 },
-  );
+  const mealId = await resolveMealId(date, slot, slotPlan, mealIds, new Map());
+  const day = new Date(date + "T00:00:00Z");
+  await prisma.plannedMeal.deleteMany({ where: { date: day, slot, locked: false } });
+  return prisma.plannedMeal.create({
+    data: { date: day, slot, mealId, aiReason: slotPlan.aiReason },
+    include: { meal: true },
+  });
 }
