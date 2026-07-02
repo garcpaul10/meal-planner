@@ -1,0 +1,78 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum MealSlot {
+  BREAKFAST
+  LUNCH
+  DINNER
+  SNACK
+}
+
+enum PlannedMealStatus {
+  PLANNED
+  EATEN
+  SKIPPED
+  EATING_OUT
+}
+
+model Meal {
+  id            String        @id @default(cuid())
+  name          String
+  mealTypes     MealSlot[]
+  category      String
+  colorHex      String
+  recipe        String?
+  ingredients   Json          @default("[]") // [{ name, qty, unit }]
+  prepMinutes   Int
+  tags          String[]      @default([])
+  isAiGenerated Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  plannedMeals  PlannedMeal[]
+}
+
+model PlannedMeal {
+  id        String            @id @default(cuid())
+  date      DateTime          @db.Date
+  slot      MealSlot
+  mealId    String
+  meal      Meal              @relation(fields: [mealId], references: [id], onDelete: Cascade)
+  locked    Boolean           @default(false)
+  status    PlannedMealStatus @default(PLANNED)
+  aiReason  String?
+  sortOrder Int               @default(0)
+
+  @@index([date])
+  @@index([mealId])
+}
+
+model PantryItem {
+  id         String    @id @default(cuid())
+  name       String
+  quantity   Float
+  unit       String
+  expiryDate DateTime? @db.Date
+  addedAt    DateTime  @default(now())
+}
+
+model ShoppingListItem {
+  id        String   @id @default(cuid())
+  name      String
+  quantity  Float
+  unit      String
+  weekStart DateTime @db.Date
+  checked   Boolean  @default(false)
+  aisle     String?
+
+  @@index([weekStart])
+}
+
+model Preference {
+  key   String @id
+  value String
+}
